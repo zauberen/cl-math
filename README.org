@@ -1,0 +1,8 @@
+#+TITLE: cl-math
+A common lisp math application.
+
+* Install Instructions
+To try out the app, load the file into =sbcl= and run
+#+begin_src lisp
+  (interactive-mode)
+#+end_src
