@@ -138,7 +138,7 @@
       (string (char equation start))
       nil))
 
-;; TODO clean this function up
+;; TODO clean this function up and support negative numbers
 (defun math-string-to-list (input)
   "Isolate each part of a math string into a string element in a list."
   (let ((curr-value "")
@@ -179,10 +179,11 @@
 (defun validate-math-list (math-list)
   "Check if the math list has valid syntax (NUMBER OPERATOR NUMBER)"
   (if (and (> (length math-list) 0)
-           (or (equal ")" (last-string math-list)) (is-number (last-string math-list)))
+           (or (equal ")" (last-string math-list))
+               (word-is-number (last-string math-list)))
            (equal 0 (mod (count-parens math-list) 2)))
       (let ((last-obj (nth 0 math-list)))
-        (not (loop for obj-idx from 1 to (- (length math-list) 1)
+        (not (loop for obj-idx from 0 to (- (length math-list) 1)
                do (if (valid-math last-obj (nth obj-idx math-list))
                       (setf last-obj (nth obj-idx math-list))
                       (return t)))))))
@@ -213,7 +214,7 @@
         (loop while math-list
               do (let ((word (pop math-list)))
                    (if (not (equal operator-str word))
-                       (if (is-number word)
+                       (if (word-is-number word)
                            (push (parse-float word) number-list)
                            (return (list :list (push word math-list) :numbers (reverse number-list)))))))
         (list :list math-list :numbers (reverse number-list)))))
