@@ -1,19 +1,27 @@
 ;;;; An expandable math app written in Common Lisp
-(defvar *operator-list* (list
-                         '(:operator "(" :order nil) ; Parens are special, just need to be here for parsing.
-                         '(:operator ")" :order nil)
-                         '(:operator "," :order nil)
-                         '(:operator "^" :function ^ :order 1)
-                         '(:operator "*" :function * :order 2)
-                         '(:operator "/" :function special-div :order 3)
-                         '(:operator "%" :function % :order 4)
-                         '(:operator "+" :function + :order 5)
-                         '(:operator "-" :function special-subtract :order 6))
+(defvar *operator-list* '(;; Parens are processed in a special function, still needed for converting math to a word list
+                          (:operator "(" :order nil)
+                          (:operator ")" :order nil)
+                          ;; Function operators
+                          (:operator "[" :order nil)
+                          (:operator "]" :order nil)
+                          (:operator "," :order nil)
+                          ;; Real operators
+                          (:operator "^" :function ^ :order 1)
+                          (:operator "*" :function * :order 2)
+                          (:operator "/" :function special-div :order 3)
+                          (:operator "%" :function % :order 4)
+                          (:operator "+" :function + :order 5)
+                          (:operator "-" :function special-subtract :order 6))
   "List of supported operators and associated functions. Function must take any number of arguments 0-n. With only 1 arg, the value must be returned simply.")
 (defvar *db* nil
   "Database of user configured variables and functions")
-(defvar *input-string* nil
-  "Store the latest equation passed into the program")
+(defvar *cached-db* nil
+  "Cache of databases, used when running functions. ")
+(defvar *default-output-variable* "answer"
+  "Default output variable, output variable is reset to this after each process-math run")
+(defvar *output-variable* "answer"
+  "Where to dump the latest equation results")
 (defvar *db-location* "~/.cache/.cl-math"
   "Where the database is stored")
 
@@ -151,10 +159,10 @@
       (setf curr-value (collect-word 'is-number input-trimmed input-index))
       ;; If there wasn't a number, try collecting an operator
       (when (or (equal curr-value "") (equal curr-value nil))
-          (setf curr-value (collect-char 'is-operator input-trimmed input-index))
-          ;; Check for variables or functions
-          (when (or (equal curr-value "") (equal curr-value nil))
-              (setf curr-value (collect-word 'is-not-operator input-trimmed input-index))))
+        (setf curr-value (collect-char 'is-operator input-trimmed input-index))
+        ;; Check for variables or functions
+        (when (or (equal curr-value "") (equal curr-value nil))
+          (setf curr-value (collect-word 'is-not-operator input-trimmed input-index))))
       ;; Debug statement
       ;; (format t "~a: ~a => ~a (~a)~%" curr-value input-index (+ input-index (max 1 (length curr-value))) (length input-trimmed))
       (push curr-value input-list)
@@ -164,8 +172,12 @@
 
 (defun valid-math (obj1 obj2)
   "Check if 2 objects are in correct math order"
-  (if (or (and (is-operator obj1) (or (is-not-operator obj2) (equal "(" obj2)))
-          (and (or (is-not-operator obj1) (equal ")" obj1)) (is-operator obj2)))
+  (if (or (and (is-operator obj1)
+               (or (is-number obj2)     ; Do not allow variables or function names, since they should have been ran before validation
+                   (equal "(" obj2)))   ; Allow an operator preceding an opening paren
+          (and (or (is-number obj1)
+                   (equal ")" obj1))    ; Allow a closing parenthesis preceding an operator
+               (is-operator obj2)))
       t))
 
 (defun last-string (list)
@@ -183,7 +195,7 @@
                (word-is-number (last-string math-list)))
            (equal 0 (mod (count-parens math-list) 2)))
       (let ((last-obj (nth 0 math-list)))
-        (not (loop for obj-idx from 0 to (- (length math-list) 1)
+        (not (loop for obj-idx from 1 to (- (length math-list) 1)
                do (if (valid-math last-obj (nth obj-idx math-list))
                       (setf last-obj (nth obj-idx math-list))
                       (return t)))))))
@@ -263,22 +275,98 @@
   "Processes math with parenthesis. No support for variables and functions."
   (solve-simple-math-list (getf (parse-inner-parenthesis math-list) :paren-list)))
 
+(defun get-variable (variable-name)
+  "Get a variable value from the db."
+  (let ((results (remove-if-not (fields :type "variable" :name variable-name) *db*)))
+    (if (> (length results) 0)
+        (getf (car results) :value))))
+
+(defun get-function (function-name)
+  "Get a function from the db."
+  (let ((results (remove-if-not (fields :type "function" :name function-name) *db*)))
+    (if (> (length results) 0)
+        (car results))))
+
+(defun cache-db ()
+  "Cache the database in the `cached-db' variable."
+  (push *db* *cached-db*)
+  (setq *db* nil))
+
+(defun pop-db-cache ()
+  "Return the database to the last version before cacheing"
+  (setf *db* (pop *cached-db*)))
+
+(defun collect-argument-list (math-list)
+  "Collects numbers and the remaining list for function arguments."
+  (let ((number-list nil))
+    (loop while math-list
+         do (let ((word (pop math-list)))
+                   (if (word-is-number word)
+                       (push word number-list)
+                       (if (equal word "]")
+                           (return (list :numbers (reverse (trim-nils number-list))
+                                         :list math-list))))))
+    (list :numbers (reverse (trim-nils number-list)) :list math-list)))
+
+(defun set-function-args (math-list function-name)
+  "Create a temporary database and set function arguments for a given function name. Returns remaining math-list."
+  (cache-db)
+  (let ((arg-name-list (getf (get-function function-name) :arguments))
+        (arg-vals (collect-argument-list math-list)))
+    (if (equal (length arg-name-list)
+               (length (getf arg-vals :numbers)))
+        (let ((arg-numbers (getf arg-vals :numbers)))
+          (loop while arg-numbers
+                do (set-variable (pop arg-name-list) (pop arg-numbers))))
+        (format t "Invalid argument count for ~a expected ~a got ~a" function-name (length arg-name-list) (length (getf arg-vals :numbers))))
+    (getf arg-vals :list)))
+
+(defun run-function (function-name)
+  "Run a math function"
+  (let ((function-obj (get-function function-name)))
+    (if (getf function-obj :value)
+        (process-math (getf function-obj :value))
+        (funcall (getf function-obj :function)))))
+
+(defun translate-variables-and-functions (math-list)
+  "Runs functions and converts variables in a math list."
+  (loop while math-list
+        collect (let ((word (pop math-list)))
+                  (if (and (is-not-operator word)
+                           (not (word-is-number word)))
+                      (cond ((word-is-variable word)
+                             (write-to-string (get-variable word)))
+                            ((word-is-function word)
+                             (progn (setf math-list (set-function-args math-list word))
+                                    (write-to-string (run-function word))))
+                            (t word))
+                      word))))
+
 (defun process-math (math-string)
   "Process a math string."
-  (let ((math-list (math-string-to-list math-string)))
-    (if (validate-math-list math-list)
-        (process-math-list math-list)
-        (format t "~a " "Invalid math"))))
+  (let ((math-list (translate-variables-and-functions (math-string-to-list math-string))))
+    (set-variable *output-variable*
+                  (if (validate-math-list math-list)
+                      (process-math-list math-list)
+                      (format t "~a " "Invalid math")))))
 
 
 ;;;; Database management
 (defun set-variable (variable-name value)
+  "Save a variable to the database then return the value. Replaces the existing value."
+  (setq *db* (remove-if (fields :type "variable" :name variable-name) *db*))
   (push (list :type "variable" :name variable-name :value value) *db*)
-  (save-db *db-location*))
+  (save-db *db-location*)
+  value)
 
 ;; TODO NOT IMPLEMENTED
-(defun set-function (function-name func)
-  (push (list :type "function" :name function-name :value func) *db*)
+(defun set-math-function (function-name func args)
+  (setq *db* (remove-if (fields :type "function" :name variable-name) *db*))
+  (push (list :type "function" :name function-name :value func :arguments args) *db*)
+  (save-db *db-location*))
+(defun set-lisp-function (function-name func args)
+  (setq *db* (remove-if (fields :type "function" :name variable-name) *db*))
+  (push (list :type "function" :name function-name :function func :arguments args) *db*)
   (save-db *db-location*))
 
 (defun save-db (filename)
@@ -326,3 +414,15 @@
                 ((equal user-input "help") (print-help))
                 ((equal user-input "defun") (interactive-set-function))
                 (t (format t "~a~%" (process-math user-input)))))))
+
+(defun main ()
+  "Main entrypoint for the application"
+  (if (> (length sb-ext:*posix-argv*) 1)
+      (progn (pop sb-ext:*posix-argv*)
+             (loop while sb-ext:*posix-argv*
+                   do (format t "~a~%" (process-math (pop sb-ext:*posix-argv*)))))
+      (interactive-mode)))
+
+(defun compile-cl-math ()
+  "Compile to an executable"
+  (sb-ext:save-lisp-and-die "clmath" :toplevel #'main :executable t))
